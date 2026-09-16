@@ -74,6 +74,9 @@ impl std::fmt::Display for ServerOutputId {
 pub struct InvokeSkillUserQuery {
     pub query: String,
     pub referenced_attachments: HashMap<String, AIAgentAttachment>,
+    /// Attribution carried over from the message this invocation was restored from, so a
+    /// resent skill query keeps its original author; `None` for a locally typed one.
+    pub base: Option<BaseUserQuery>,
 }
 
 impl ServerOutputId {

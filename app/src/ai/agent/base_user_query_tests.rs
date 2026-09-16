@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use prost::Message as _;
+use session_sharing_protocol::common::ProfileData;
 use warp_multi_agent_api as api;
 use warp_multi_agent_api::AgentType;
 
@@ -170,5 +171,147 @@ fn seed_keeps_the_text_verbatim_when_the_server_classified_the_mode_differently(
     assert_eq!(
         seeded,
         ("/plan foo".to_string(), UserQueryMode::Normal, None)
+    );
+}
+
+fn external_author() -> api::QueryAuthor {
+    api::QueryAuthor {
+        principal: Some(api::query_author::Principal::User(api::WarpUser {
+            uid: "external-author".into(),
+            email: "author@example.com".into(),
+            team_uid: "author-team".into(),
+        })),
+        resolution: api::IdentityResolution::ExternalAccountBinding.into(),
+    }
+}
+
+fn external_source() -> api::ExternalMessage {
+    api::ExternalMessage {
+        body: "new message".into(),
+        platform: Some(api::external_message::Platform::Slack(
+            api::external_message::Slack {
+                channel_id: "channel".into(),
+                thread_ts: "thread".into(),
+                thread_history: vec![api::external_message::slack::ThreadMessage {
+                    text: "earlier context".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+fn external_origin() -> api::UserQueryOrigin {
+    api::UserQueryOrigin {
+        variant: Some(api::user_query_origin::Variant::ExternalPlatform(
+            api::user_query_origin::ExternalPlatform {},
+        )),
+    }
+}
+
+fn unavailable_reason(query: &api::request::input::UserQuery) -> &str {
+    let Some(api::user_query_origin::Variant::ServerSynthesized(origin)) = query
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.variant.as_ref())
+    else {
+        panic!(
+            "expected an explicit unavailable origin, got {:?}",
+            query.origin
+        );
+    };
+    &origin.reason
+}
+
+#[test]
+fn a_viewer_with_a_profile_is_recorded_as_the_author_without_a_team() {
+    let viewer = ProfileData {
+        firebase_uid: "viewer".into(),
+        email: Some("viewer@example.com".into()),
+        ..Default::default()
+    };
+
+    let query = BaseUserQuery::for_viewer(Some(&viewer)).to_proto();
+
+    assert_eq!(query.origin, Some(super::warp_client_origin()));
+    assert_eq!(
+        query.author,
+        Some(api::QueryAuthor {
+            principal: Some(api::query_author::Principal::User(api::WarpUser {
+                uid: "viewer".into(),
+                email: "viewer@example.com".into(),
+                team_uid: String::new(),
+            })),
+            resolution: api::IdentityResolution::ClientSession.into(),
+        })
+    );
+    assert!(query.source_message.is_none());
+    assert!(query.query.is_empty(), "the text comes from the prompt");
+}
+
+#[test]
+fn a_viewer_without_a_profile_is_explicitly_unavailable_rather_than_the_sharer() {
+    for profile in [None, Some(&ProfileData::default())] {
+        let query = BaseUserQuery::for_viewer(profile).to_proto();
+        assert_eq!(
+            unavailable_reason(&query),
+            "shared_session_author_unavailable"
+        );
+        assert!(query.author.is_none());
+        assert!(query.source_message.is_none());
+    }
+}
+
+#[test]
+fn unattributed_names_its_reason_and_claims_no_author() {
+    let query = BaseUserQuery::unattributed("user_query_unavailable").to_proto();
+    assert_eq!(unavailable_reason(&query), "user_query_unavailable");
+    assert!(query.author.is_none());
+}
+
+#[test]
+fn from_message_lifts_only_the_attribution_and_skips_unattributed_messages() {
+    assert!(BaseUserQuery::from_message(&api::message::UserQuery::default()).is_none());
+
+    let message = api::message::UserQuery {
+        query: "formatted follow-up".into(),
+        mode: Some(api::UserQueryMode { r#type: None }),
+        origin: Some(external_origin()),
+        author: Some(external_author()),
+        source_message: Some(external_source()),
+        ..Default::default()
+    };
+
+    let lifted = BaseUserQuery::from_message(&message)
+        .expect("an attributed message is lifted")
+        .to_proto();
+
+    assert_eq!(lifted.origin, Some(external_origin()));
+    assert_eq!(lifted.author, Some(external_author()));
+    assert_eq!(lifted.source_message, Some(external_source()));
+    assert!(
+        lifted.query.is_empty(),
+        "text and mode are the live input's, not the message's"
+    );
+    assert!(lifted.mode.is_none());
+}
+
+#[test]
+fn from_message_keeps_an_unresolved_sender() {
+    let message = api::message::UserQuery {
+        author: Some(api::QueryAuthor {
+            principal: None,
+            resolution: api::IdentityResolution::Unresolved.into(),
+        }),
+        ..Default::default()
+    };
+
+    let lifted = BaseUserQuery::from_message(&message).unwrap().to_proto();
+
+    assert_eq!(
+        lifted.author.unwrap().resolution,
+        api::IdentityResolution::Unresolved as i32
     );
 }

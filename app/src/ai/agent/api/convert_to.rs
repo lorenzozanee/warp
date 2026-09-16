@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use chrono::{DateTime, Local, Timelike};
 use warp_multi_agent_api as api;
 
+use crate::ai::agent::base_user_query::warp_client_origin;
 use crate::ai::agent::{
     AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext, AIAgentInput,
     BaseUserQuery, DriveObjectPayload, MCPContext, PassiveSuggestionResultType,
@@ -217,6 +218,7 @@ pub(super) fn convert_input(
                         api::request::input::InvokeSkill {
                             skill: Some(skill.into()),
                             user_query: user_query.map(|user_query| {
+                                let attribution = attribution_fields(user_query.base.as_ref());
                                 api::request::input::UserQuery {
                                     query: user_query.query,
                                     referenced_attachments: user_query
@@ -226,9 +228,9 @@ pub(super) fn convert_input(
                                         .collect(),
                                     mode: None,
                                     intended_agent: Default::default(),
-                                    origin: None,
-                                    author: None,
-                                    source_message: None,
+                                    origin: attribution.origin,
+                                    author: attribution.author,
+                                    source_message: attribution.source_message,
                                 }
                             }),
                         },
@@ -309,7 +311,29 @@ fn user_query_proto(
             .entry(key)
             .or_insert(attachment);
     }
+    mark_fresh_local(base, &mut proto);
     proto
+}
+
+/// Marks a query this client built from local input as freshly typed here.
+///
+/// warp-server attributes an input to the authenticated caller only when it carries a bare
+/// `WarpClient` origin. An input with no origin at all is deliberately left alone, because an
+/// older relay could have forwarded it from another participant. Without this marker, locally
+/// typed queries would be recorded with no author. A query with a base is never marked: its
+/// fields, including an absent origin, are what the server or viewer decided.
+fn mark_fresh_local(base: Option<&BaseUserQuery>, query: &mut api::request::input::UserQuery) {
+    if base.is_none() && query.origin.is_none() {
+        query.origin = Some(warp_client_origin());
+    }
+}
+
+/// The attribution fields for a query built outside `user_query_proto` (skill invocations): the
+/// base metadata when there is any, otherwise the fresh-local marker.
+fn attribution_fields(base: Option<&BaseUserQuery>) -> api::request::input::UserQuery {
+    let mut fields = base.map(BaseUserQuery::to_proto).unwrap_or_default();
+    mark_fresh_local(base, &mut fields);
+    fields
 }
 
 fn convert_input_to_user_input(

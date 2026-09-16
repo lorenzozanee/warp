@@ -11,8 +11,9 @@
 //! when the request is sent. Every other field, including ones this client does not model
 //! (origin, author, source message, ...), travels through untouched.
 //!
-//! Older relays and viewer-typed prompts leave `user_query_b64` unset, and a payload that does
-//! not decode is ignored; both fall back to the request's `prompt` and `attachments`.
+//! Viewer-typed prompts and older relays leave `user_query_b64` unset; their attribution comes
+//! from the viewer's presence profile. Invalid payloads get explicit unavailable attribution.
+//! Both fall back to the request's `prompt` and `attachments` for content.
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 #[cfg(any(test, feature = "local_tty"))]
 use prost::Message as _;
+use session_sharing_protocol::common::ProfileData;
 use warp_multi_agent_api as api;
 use warp_multi_agent_api::AgentType;
 
@@ -58,6 +60,62 @@ impl BaseUserQuery {
     #[cfg(any(test, feature = "local_tty"))]
     pub(crate) fn from_proto(query: api::request::input::UserQuery) -> Self {
         Self(Arc::new(query))
+    }
+
+    /// The query to send for a prompt a shared-session viewer typed themselves. The relay
+    /// leaves `user_query_b64` unset for those, so the sharer records the viewer from presence:
+    /// a `WarpClient` origin and the viewer as author. The relay authenticated the viewer and
+    /// the sharer only observes them, so the resolution is `CLIENT_SESSION` and no team is
+    /// claimed. A viewer whose profile is unknown gets an explicit `ServerSynthesized` origin,
+    /// so the query is never attributed to the sharer as if they had typed it.
+    pub(crate) fn for_viewer(profile: Option<&ProfileData>) -> Self {
+        let Some(profile) = profile.filter(|profile| !profile.firebase_uid.is_empty()) else {
+            return Self::unattributed("shared_session_author_unavailable");
+        };
+        Self::from_proto(api::request::input::UserQuery {
+            origin: Some(warp_client_origin()),
+            author: Some(api::QueryAuthor {
+                principal: Some(api::query_author::Principal::User(api::WarpUser {
+                    uid: profile.firebase_uid.clone(),
+                    email: profile.email.clone().unwrap_or_default(),
+                    team_uid: String::new(),
+                })),
+                resolution: api::IdentityResolution::ClientSession.into(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// A query whose author cannot be established, marked with a `ServerSynthesized` origin
+    /// naming `reason` so warp-server neither treats it as fresh local input nor leaves it
+    /// looking like the sharer's own.
+    pub(crate) fn unattributed(reason: &str) -> Self {
+        Self::from_proto(api::request::input::UserQuery {
+            origin: Some(api::UserQueryOrigin {
+                variant: Some(api::user_query_origin::Variant::ServerSynthesized(
+                    api::user_query_origin::ServerSynthesized {
+                        reason: reason.to_string(),
+                    },
+                )),
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Lifts a persisted or streamed `Message.UserQuery`'s attribution (origin, author, source
+    /// message, and nothing else) so a restored or live input keeps who was behind it when it
+    /// is sent again. `None` when the message carries no attribution: historical queries stay
+    /// unattributed rather than being re-stamped as the current user's.
+    pub(crate) fn from_message(query: &api::message::UserQuery) -> Option<Self> {
+        if query.origin.is_none() && query.author.is_none() && query.source_message.is_none() {
+            return None;
+        }
+        Some(Self::from_proto(api::request::input::UserQuery {
+            origin: query.origin.clone(),
+            author: query.author.clone(),
+            source_message: query.source_message.clone(),
+            ..Default::default()
+        }))
     }
 
     /// The query text, or `None` when the server left it empty and only duplicated it into
@@ -128,6 +186,15 @@ impl fmt::Debug for BaseUserQuery {
             .field("has_author", &self.0.author.is_some())
             .field("has_source_message", &self.0.source_message.is_some())
             .finish()
+    }
+}
+
+/// The origin of a query a person typed in a Warp client.
+pub(crate) fn warp_client_origin() -> api::UserQueryOrigin {
+    api::UserQueryOrigin {
+        variant: Some(api::user_query_origin::Variant::WarpClient(
+            api::user_query_origin::WarpClient {},
+        )),
     }
 }
 

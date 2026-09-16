@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use warp_core::command::ExitCode;
 use warp_multi_agent_api as api;
 
+use crate::ai::agent::base_user_query::warp_client_origin;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext, AIAgentInput,
@@ -283,9 +284,98 @@ fn local_user_query_converts_without_a_base() {
     assert_eq!(query.query, "hello");
     assert_eq!(query.mode, Some(normal_mode()));
     assert_eq!(query.intended_agent, 0);
-    assert!(query.origin.is_none());
+    // The fresh-local marker: warp-server resolves the author of a bare `WarpClient` origin
+    // to the authenticated caller, and leaves an origin-less input alone.
+    assert_eq!(query.origin, Some(warp_client_origin()));
     assert!(query.author.is_none());
     assert!(query.source_message.is_none());
+}
+
+#[test]
+fn an_injected_query_without_an_origin_is_not_marked_fresh() {
+    // The server (or an older relay) decided what this query carries; an absent origin is
+    // theirs to leave absent, so the server does not attribute it to the sharer.
+    let base = BaseUserQuery::from_proto(api::request::input::UserQuery {
+        query: "forwarded text".to_string(),
+        ..Default::default()
+    });
+
+    let query = converted_user_query(user_query_input(
+        "forwarded text",
+        Some(base),
+        HashMap::new(),
+    ));
+
+    assert!(query.origin.is_none());
+    assert!(query.author.is_none());
+}
+
+#[test]
+fn injected_attribution_is_sent_as_is() {
+    let author = api::QueryAuthor {
+        principal: Some(api::query_author::Principal::User(api::WarpUser {
+            uid: "external-author".to_string(),
+            email: "author@example.com".to_string(),
+            team_uid: "team".to_string(),
+        })),
+        resolution: api::IdentityResolution::ExternalAccountBinding.into(),
+    };
+    let origin = api::UserQueryOrigin {
+        variant: Some(api::user_query_origin::Variant::ExternalPlatform(
+            api::user_query_origin::ExternalPlatform {},
+        )),
+    };
+    let source = api::ExternalMessage {
+        body: "original message".to_string(),
+        ..Default::default()
+    };
+    let base = BaseUserQuery::from_proto(api::request::input::UserQuery {
+        origin: Some(origin.clone()),
+        author: Some(author.clone()),
+        source_message: Some(source.clone()),
+        ..Default::default()
+    });
+
+    let query = converted_user_query(user_query_input(
+        "rendered prompt",
+        Some(base),
+        HashMap::new(),
+    ));
+
+    assert_eq!(query.query, "rendered prompt");
+    assert_eq!(query.origin, Some(origin));
+    assert_eq!(query.author, Some(author));
+    assert_eq!(query.source_message, Some(source));
+}
+
+#[test]
+fn a_viewer_typed_query_carries_the_viewer_as_author() {
+    let viewer = session_sharing_protocol::common::ProfileData {
+        firebase_uid: "viewer".to_string(),
+        email: Some("viewer@example.com".to_string()),
+        ..Default::default()
+    };
+
+    let query = converted_user_query(user_query_input(
+        "viewer text",
+        Some(BaseUserQuery::for_viewer(Some(&viewer))),
+        HashMap::new(),
+    ));
+
+    assert_eq!(
+        query.query, "viewer text",
+        "the prompt text fills the empty base query"
+    );
+    assert_eq!(query.origin, Some(warp_client_origin()));
+    let Some(api::query_author::Principal::User(user)) = query.author.unwrap().principal else {
+        panic!("expected the viewer as author");
+    };
+    assert_eq!(user.uid, "viewer");
+    assert_eq!(user.email, "viewer@example.com");
+    assert!(
+        user.team_uid.is_empty(),
+        "the sharer never claims a team for a viewer"
+    );
 }
 
 #[test]

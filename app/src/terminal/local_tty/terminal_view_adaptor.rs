@@ -181,13 +181,23 @@ fn accept_agent_prompt(
         return;
     }
 
-    // warp-server-injected follow-ups carry the query itself as the base of the request this
-    // sharer sends; the relay and viewers leave it unset, and a payload that does not decode
-    // falls back to `prompt` + `attachments`.
-    let base = request
-        .user_query_b64
-        .as_deref()
-        .and_then(BaseUserQuery::decode_b64);
+    // warp-server-injected follow-ups carry the query itself. Viewer-typed prompts and older
+    // relays leave it unset; those are attributed to the viewer from presence so the server
+    // never records them as the sharer's own input. A payload that does not decode is sent
+    // with an explicit unavailable origin and falls back to `prompt` + `attachments`.
+    let base = match request.user_query_b64.as_deref() {
+        Some(encoded) => BaseUserQuery::decode_b64(encoded)
+            .unwrap_or_else(|| BaseUserQuery::unattributed("user_query_unavailable")),
+        None => {
+            let presence = terminal_view
+                .as_ref(ctx)
+                .shared_session_presence_manager()
+                .map(|manager| manager.as_ref(ctx));
+            let profile =
+                presence.and_then(|presence| presence.participant_profile(&participant_id));
+            BaseUserQuery::for_viewer(profile)
+        }
+    };
 
     // Execute the agent prompt in the Oz-harness case.
     terminal_view.update(ctx, |view, ctx| {
@@ -208,7 +218,7 @@ fn accept_agent_prompt(
                 request.server_conversation_token,
                 request.attachments.clone(),
                 participant_id.clone(),
-                base,
+                Some(base),
                 ctx,
             );
         });
