@@ -64,6 +64,7 @@ use crate::ai::ambient_agents::{
 };
 use crate::ai::bedrock_credentials;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
+use crate::ai::blocklist::block::FinishReason;
 use crate::ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel;
 use crate::ai::blocklist::orchestration_event_streamer::{
     register_agent_event_consumer, unregister_agent_event_consumer,
@@ -72,7 +73,7 @@ use crate::ai::blocklist::orchestration_events::OrchestrationEventService;
 use crate::ai::blocklist::pending_cli_harness_prompt_queue::PendingCliHarnessPromptQueue;
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, ConversationStatusUpdate, FinalizeReason,
-    finalize_recording_for_conversation,
+    QueuedQueryEvent, QueuedQueryModel, finalize_recording_for_conversation,
 };
 use crate::ai::cloud_environments::{
     AmbientAgentEnvironment, CloudAmbientAgentEnvironment, GithubRepo, SourceRepo,
@@ -124,6 +125,8 @@ use environment::PrepareEnvironmentError;
 use mcp_startup::MCP_SERVER_STARTUP_TIMEOUT;
 pub(crate) use snapshot::upload_snapshot_for_handoff;
 use terminal::TerminalDriverEvent;
+#[cfg(not(unix))]
+use termination::ObservedSignal;
 use termination::{InterruptSignal, RunEndCause};
 #[cfg(unix)]
 use termination::{emulate_default_and_exit, watch_interrupt_signals};
@@ -365,13 +368,16 @@ impl<T: Send + 'static> IdleTimeoutSender<T> {
         }
     }
 
-    /// End the run with `value`, deferring by `idle_timeout` when set and completing immediately
-    /// when it is `None`.
+    /// End the run with `value`, deferring by a positive `idle_timeout` and completing immediately
+    /// for zero or `None`.
     fn complete_with_optional_idle(&self, idle_timeout: Option<Duration>, value: T) {
-        if let Some(idle_timeout) = idle_timeout {
-            self.end_run_after(idle_timeout, value);
-        } else {
-            self.end_run_now(value);
+        match idle_timeout {
+            Some(Duration::ZERO) => {
+                self.cancel_idle_timeout();
+                self.end_run_now(value);
+            }
+            Some(idle_timeout) => self.end_run_after(idle_timeout, value),
+            None => self.end_run_now(value),
         }
     }
 }
@@ -1148,6 +1154,19 @@ impl AgentDriver {
             ctx,
         )?;
 
+        // Sharing starts asynchronously from terminal creation, before run_internal's setup waits.
+        log::info!(
+            "event=driver_queue_configuration task_id={task_id:?} harness={selected_harness} sharing_requested={should_share} native_queue_enabled={}",
+            selected_harness == Harness::Oz && (should_share || task_id.is_some()),
+        );
+        if selected_harness == Harness::Oz && (should_share || task_id.is_some()) {
+            let terminal = terminal_driver.as_ref(ctx).terminal_view().clone();
+            terminal.update(ctx, |terminal, ctx| {
+                terminal.ai_controller().update(ctx, |controller, ctx| {
+                    controller.bind_native_prompt_conversation(restored_conversation_id, ctx);
+                });
+            });
+        }
         // Subscribe to TerminalDriver events for task-specific handling.
         ctx.subscribe_to_model(&terminal_driver, |me, _, event, ctx| {
             me.handle_terminal_driver_event(event, ctx);
@@ -1298,6 +1317,12 @@ impl AgentDriver {
     /// Pair to the registration in `new` / `execute_run`. No-op when
     /// nothing was registered.
     fn unregister_streamer_consumer(&self, ctx: &mut ModelContext<Self>) {
+        let terminal = self.terminal_driver.as_ref(ctx).terminal_view().clone();
+        terminal.update(ctx, |terminal, ctx| {
+            terminal.ai_controller().update(ctx, |controller, ctx| {
+                controller.unbind_native_prompt_conversation(ctx);
+            });
+        });
         let Some(conversation_id) = self.run_conversation_id else {
             return;
         };
@@ -1463,7 +1488,7 @@ impl AgentDriver {
                         }
                     };
                     #[cfg(not(unix))]
-                    let signal_fut = future::pending::<InterruptSignal>();
+                    let signal_fut = future::pending::<ObservedSignal>();
 
                     let run = Self::run_internal(task, foreground.clone()).fuse();
                     let timer = timer_fut.fuse();
@@ -1497,21 +1522,37 @@ impl AgentDriver {
                              run_internal to allow recording finalization"
                         );
                     }
-                    RunEndCause::Signal(InterruptSignal::Term) => {
-                        log::warn!(
-                            "SIGTERM received; aborting run_internal to save a handoff snapshot \
-                             before remaining teardown (limited grace period before SIGKILL)"
-                        );
-                    }
-                    RunEndCause::Signal(InterruptSignal::Int) => {
-                        log::warn!(
-                            "SIGINT received; aborting run_internal to save a handoff snapshot \
-                             before restoring default terminate"
-                        );
-                    }
+                    RunEndCause::Signal(signal) => match signal.signal {
+                        InterruptSignal::Term => {
+                            log::warn!(
+                                "SIGTERM received; aborting run_internal to save a handoff \
+                                 snapshot before remaining teardown (limited grace period before \
+                                 SIGKILL)"
+                            );
+                        }
+                        InterruptSignal::Int => {
+                            log::warn!(
+                                "SIGINT received; aborting run_internal to save a handoff snapshot \
+                                 before restoring default terminate"
+                            );
+                        }
+                    },
                     RunEndCause::Completed => {}
                 }
 
+                if !matches!(cause, RunEndCause::Completed)
+                    && let Ok(Some(runner)) = foreground.spawn(|me, _| me.harness.clone()).await
+                {
+                    // These interrupts drop run_harness before its ordinary final-save path.
+                    Self::force_kill_harness(&foreground).await;
+                    report_if_error!(
+                        runner.finish_saves(&foreground).await.context(
+                            "Failed to save final harness conversation after interruption"
+                        )
+                    );
+                    // TODO(vkodithala): Decide how runner cleanup fits within the remaining
+                    // shutdown budget; force-killing skips bridge and resumption-state cleanup.
+                }
                 let snapshot_disabled = foreground
                     .spawn(|me, _| me.snapshot_disabled)
                     .await
@@ -1521,7 +1562,7 @@ impl AgentDriver {
 
                 match cause {
                     RunEndCause::Signal(signal) => {
-                        let signal_name = match signal {
+                        let signal_name = match signal.signal {
                             InterruptSignal::Term => "SIGTERM",
                             InterruptSignal::Int => "SIGINT",
                         };
@@ -1530,7 +1571,7 @@ impl AgentDriver {
                         // emulate default terminate if snapshot/recording gets stuck.
                         Self::save_run_artifacts(&foreground, snapshot_allowed).await;
                         #[cfg(unix)]
-                        emulate_default_and_exit(signal);
+                        emulate_default_and_exit(signal.signal);
                         #[cfg(not(unix))]
                         {
                             let _ = signal;
@@ -3160,7 +3201,8 @@ impl AgentDriver {
                 _ = warpui::r#async::Timer::after(HARNESS_SAVE_INTERVAL).fuse() => {
                     log::debug!("Triggering periodic save of harness conversation data");
                     report_if_error!(runner
-                        .save_conversation(SavePoint::Periodic, foreground)
+                        .clone()
+                        .request_save(SavePoint::Periodic, foreground)
                         .await
                         .context("Failed to save harness conversation (periodic)"));
                 }
@@ -3237,17 +3279,12 @@ impl AgentDriver {
 
         // Final save after the command finishes.
         log::debug!("Triggering final save of harness conversation data");
-        let final_save_succeeded = match runner
-            .save_conversation(SavePoint::Final, foreground)
+        let final_save_result = runner
+            .finish_saves(foreground)
             .await
-            .context("Failed to save harness conversation (final)")
-        {
-            Ok(()) => true,
-            Err(err) => {
-                report_error!(err);
-                false
-            }
-        };
+            .context("Failed to save final harness conversation");
+        let final_save_succeeded = final_save_result.is_ok();
+        report_if_error!(final_save_result);
         let cleanup_disposition = if final_save_succeeded
             && detected_runtime_failure.is_none()
             && matches!(command_result.as_ref(), Ok(exit_code) if exit_code.was_successful())
@@ -3519,7 +3556,47 @@ impl AgentDriver {
                 run_exit = run_exit.with_wait(wait);
             }
         }
-        let restored_conversation_id = self.restored_conversation_id;
+        let terminal = self.terminal_driver.as_ref(ctx).terminal_view();
+        let prepared_conversation_id = terminal
+            .as_ref(ctx)
+            .ai_controller()
+            .as_ref(ctx)
+            .native_prompt_conversation_id();
+        let restored_conversation_id = prepared_conversation_id.or(self.restored_conversation_id);
+        let queue_run_exit = run_exit.clone();
+        if let Some(conversation_id) = prepared_conversation_id {
+            let queue_run_exit = queue_run_exit.clone();
+            ctx.subscribe_to_model(&QueuedQueryModel::handle(ctx), move |me, _, event, ctx| {
+                let event_id = match event {
+                    QueuedQueryEvent::Appended {
+                        conversation_id, ..
+                    }
+                    | QueuedQueryEvent::DispatchStateChanged { conversation_id }
+                    | QueuedQueryEvent::Removed {
+                        conversation_id, ..
+                    }
+                    | QueuedQueryEvent::Cleared { conversation_id } => *conversation_id,
+                    _ => return,
+                };
+                if event_id != conversation_id {
+                    return;
+                }
+                let queue = QueuedQueryModel::as_ref(ctx);
+                if queue.has_pending_native_injections(conversation_id) {
+                    queue_run_exit.cancel_idle_timeout();
+                } else if BlocklistAIHistoryModel::as_ref(ctx)
+                    .conversation(&conversation_id)
+                    .is_some_and(|conversation| {
+                        conversation.status() == &ConversationStatus::Success
+                    })
+                {
+                    queue_run_exit.complete_with_optional_idle(
+                        me.idle_on_complete,
+                        SDKConversationOutputStatus::Success,
+                    );
+                }
+            });
+        }
 
         // ServerSide prompts enter the agent view and emit
         // `CloudModeSetupPhaseEnded` to tear down the Cloud Mode Setup V2 chip.
@@ -3547,7 +3624,7 @@ impl AgentDriver {
                         .send_cloud_mode_setup_phase_ended_for_shared_session();
                 })
             });
-            if self.skip_initial_turn {
+            if self.skip_initial_turn && prepared_conversation_id.is_none() {
                 run_exit.complete_with_optional_idle(
                     self.idle_on_complete,
                     SDKConversationOutputStatus::Success,
@@ -3750,6 +3827,17 @@ impl AgentDriver {
                             }
                         };
 
+                        if matches!(output_status, SDKConversationOutputStatus::Success)
+                            && QueuedQueryModel::as_ref(ctx).has_pending_native_injections(*conversation_id)
+                        {
+                            log::info!(
+                                "event=worker_exit_deferred task_id={:?} conversation_id={conversation_id} reason=pending_native_injections queue_len={}",
+                                me.task_id, QueuedQueryModel::as_ref(ctx).queue(*conversation_id).len(),
+                            );
+                            run_exit.cancel_idle_timeout();
+                            return;
+                        }
+
                         // Errors here are terminal: in-flight recoveries surface as
                         // TransientError (handled above). Whether the process outlives either
                         // kind of terminal status is controlled by the `--idle-on-complete` /
@@ -3892,6 +3980,15 @@ impl AgentDriver {
                                 AgentViewEntryOrigin::Cli,
                                 ctx,
                             );
+                        } else if let Some(conversation_id) = prepared_conversation_id {
+                            terminal.ai_controller().update(ctx, |controller, ctx| {
+                                controller.send_user_query_in_conversation_no_lrc_subagent(
+                                    prompt_str,
+                                    conversation_id,
+                                    None,
+                                    ctx,
+                                );
+                            });
                         } else {
                             terminal.set_ai_input_mode_with_query(Some(&prompt_str), ctx);
                             terminal
@@ -3922,6 +4019,59 @@ impl AgentDriver {
                     }
                 })
             });
+
+            // Dispatch any shared-session startup follow-up that arrived while the initial
+            // prompt was being prepared. Must run after the update above returns, since
+            // `dispatch_queued_warp_agent_prompt` targets this terminal surface's *active*
+            // conversation, which the initial send just set. If more than one row accumulated,
+            // the rest are picked up one at a time by `Steering`'s piggyback-on-next-request
+            // mechanism or the idle-triggered drain, not flushed here all at once.
+            if let Some(conversation_id) = prepared_conversation_id {
+                self.terminal_driver.update(ctx, |td, ctx| {
+                    td.with_terminal_view(ctx, |terminal, ctx| {
+                        terminal.ai_controller().update(ctx, |controller, ctx| {
+                            controller.dispatch_queued_warp_agent_prompt(
+                                conversation_id,
+                                None,
+                                ctx,
+                            );
+                        });
+                    });
+                });
+            }
+        }
+
+        if self.skip_initial_turn
+            && let Some(conversation_id) = prepared_conversation_id
+        {
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.finish_native_setup(conversation_id, ctx);
+            });
+            // No prompt was ever sent for a promptless run, so the conversation is definitely
+            // idle here: `drain_queued_prompts` alone is sufficient, since it already detects a
+            // shared-session head row and delegates to the controller itself. A separate,
+            // preceding dispatch call would race it -- starting a second row's stream before the
+            // first produced any output cancels the first, silently dropping it.
+            self.terminal_driver.update(ctx, |td, ctx| {
+                td.with_terminal_view(ctx, |terminal, ctx| {
+                    terminal.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+                });
+            });
+            if !QueuedQueryModel::as_ref(ctx).has_pending_native_injections(conversation_id)
+                && !self
+                    .terminal_driver
+                    .as_ref(ctx)
+                    .terminal_view()
+                    .as_ref(ctx)
+                    .ai_controller()
+                    .as_ref(ctx)
+                    .has_active_stream_for_conversation(conversation_id, ctx)
+            {
+                queue_run_exit.complete_with_optional_idle(
+                    self.idle_on_complete,
+                    SDKConversationOutputStatus::Success,
+                );
+            }
         }
 
         // Wrap `internal_rx` instead of returning it directly: once the run's `on_commit` has
@@ -4042,6 +4192,9 @@ impl AgentDriver {
                         | CLIAgentSessionStatus::Failed { .. }
                         | CLIAgentSessionStatus::Blocked { .. }
                         | CLIAgentSessionStatus::Cancelled => {
+                            if me.harness.is_some() {
+                                me.request_harness_save(ctx);
+                            }
                             let idle_window = idle_window_for_cli_session_status(
                                 status,
                                 me.idle_on_complete,
@@ -4101,32 +4254,29 @@ impl AgentDriver {
                         return;
                     }
 
-                    let Some(runner) = me.harness.clone() else {
-                        return;
-                    };
-                    let spawner = ctx.spawner();
-                    ctx.spawn(
-                        async move {
-                            log::debug!(
-                                "Triggering post-turn harness session update from CLI agent event"
-                            );
-                            report_if_error!(runner
-                                .handle_session_update(&spawner)
-                                .await
-                                .context("Failed to update harness state from CLI session event"));
-                            log::debug!("Triggering post-turn save of harness conversation data");
-                            report_if_error!(runner
-                                .save_conversation(SavePoint::PostTurn, &spawner)
-                                .await
-                                .context("Failed to save harness conversation (post-turn)"));
-                        },
-                        |_, _, _| {},
-                    );
+                    me.request_harness_save(ctx);
                 }
                 CLIAgentSessionsModelEvent::Started { .. }
                 | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
                 | CLIAgentSessionsModelEvent::Ended { .. } => {}
             });
+    }
+    fn request_harness_save(&self, ctx: &mut ModelContext<Self>) {
+        let Some(runner) = self.harness.clone() else {
+            return;
+        };
+        let foreground = ctx.spawner();
+        ctx.spawn(
+            async move {
+                report_if_error!(
+                    runner
+                        .request_save(SavePoint::PostTurn, &foreground)
+                        .await
+                        .context("Failed to request harness conversation save")
+                );
+            },
+            |_, _, _| {},
+        );
     }
 
     /// Drains and delivers, as genuine PTY follow-ups via `TerminalDriver::send_text_to_cli`,
@@ -4549,6 +4699,7 @@ fn typed_secret_entries(secret: &ManagedSecretValue) -> Vec<(&'static str, &str)
         // A registry credential authenticates an image pull, not the agent process, and
         // is never injected into the terminal session.
         ManagedSecretValue::DockerRegistry { .. } => vec![],
+        ManagedSecretValue::AwsEcrCredential { .. } => vec![],
     }
 }
 

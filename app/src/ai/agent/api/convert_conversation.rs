@@ -519,7 +519,8 @@ impl ConvertToExchanges for &api::Task {
                 | api::message::Message::ArtifactEvent(_)
                 | api::message::Message::MessagesReceivedFromAgents(_)
                 | api::message::Message::ModelUsed(_)
-                | api::message::Message::OrchestrationConfigSnapshot(_) => false,
+                | api::message::Message::OrchestrationConfigSnapshot(_)
+                | api::message::Message::RequestMetadata(_) => false,
             };
 
             if !added_message_as_exchange_input
@@ -1929,15 +1930,18 @@ fn create_exchange_from_messages(
                 _ => None,
             })
         })
-        // Fall back to any timestamp from the messages in this exchange
+        // Fall back to the earliest message timestamp in this exchange
         .or_else(|| {
-            message_ids.iter().find_map(|message_id| {
-                message_map.get(message_id.as_str()).and_then(|message| {
-                    message.timestamp.as_ref().map(|timestamp| {
-                        proto_timestamp_to_local_datetime(timestamp.seconds, timestamp.nanos)
+            message_ids
+                .iter()
+                .filter_map(|message_id| {
+                    message_map.get(message_id.as_str()).and_then(|message| {
+                        message.timestamp.as_ref().map(|timestamp| {
+                            proto_timestamp_to_local_datetime(timestamp.seconds, timestamp.nanos)
+                        })
                     })
                 })
-            })
+                .min()
         })
         .unwrap_or_default();
 
@@ -2081,7 +2085,8 @@ where
                 | api::message::Message::UpdateTodos(_)
                 | api::message::Message::MessagesReceivedFromAgents(_)
                 | api::message::Message::EventsFromAgents(_)
-                | api::message::Message::PassiveSuggestionResult(_) => None,
+                | api::message::Message::PassiveSuggestionResult(_)
+                | api::message::Message::RequestMetadata(_) => None,
                 // Anything else is considered agent/stream activity we want to measure
                 api::message::Message::AgentOutput(_)
                 | api::message::Message::AgentReasoning(_)

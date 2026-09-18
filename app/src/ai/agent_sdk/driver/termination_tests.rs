@@ -2,6 +2,9 @@ use std::fs;
 use std::time::Duration;
 
 use futures::executor::block_on;
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
+use signal_hook::low_level::siginfo::{Cause, Sent};
 use tempfile::TempDir;
 
 use super::InterruptSignal;
@@ -33,15 +36,22 @@ fn signal_lifecycle_child() -> ! {
         block_on(super::watch_interrupt_signals(&background)).expect("signal watch");
     println!("{READY_MARKER}");
 
-    let signal = block_on(signal_rx).expect("interrupt signal");
-    assert_eq!(signal, expected);
+    let observed = block_on(signal_rx).expect("interrupt signal");
+    assert_eq!(observed.signal, expected);
+    #[cfg(target_os = "linux")]
+    {
+        let sender = observed.sender.expect("sender process");
+        assert_eq!(sender.pid, nix::unistd::getppid().as_raw());
+        assert_eq!(sender.uid, nix::unistd::getuid().as_raw());
+        assert_eq!(observed.cause, Cause::Sent(Sent::User));
+    }
 
     if kind == "int-hang" {
         println!("{SHUTDOWN_MARKER}");
         std::thread::sleep(STUCK_SHUTDOWN_BAILOUT);
         std::process::exit(1);
     }
-    super::emulate_default_and_exit(signal);
+    super::emulate_default_and_exit(observed.signal);
 }
 
 /// Re-executes this test binary as a child running only `test_name`, delivers
@@ -54,9 +64,9 @@ fn signal_lifecycle_child() -> ! {
 fn spawn_signal_lifecycle_child(
     kind: &str,
     test_name: &str,
-    first_sig: i32,
-    second_sig: Option<i32>,
-    expected_sig: i32,
+    first_sig: Signal,
+    second_sig: Option<Signal>,
+    expected_sig: Signal,
     expect_stuck_shutdown: bool,
 ) {
     use std::os::unix::process::ExitStatusExt as _;
@@ -110,23 +120,19 @@ fn spawn_signal_lifecycle_child(
 
     wait_for_marker(&mut child, READY_MARKER);
 
-    // SAFETY: `child.id()` is this child's pid; the signal is sent only to it.
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, first_sig);
-    }
+    let child_pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    nix::sys::signal::kill(child_pid, first_sig).unwrap();
 
     if let Some(second_sig) = second_sig {
         wait_for_marker(&mut child, SHUTDOWN_MARKER);
-        unsafe {
-            libc::kill(child.id() as libc::pid_t, second_sig);
-        }
+        nix::sys::signal::kill(child_pid, second_sig).unwrap();
     }
 
     let status = child.wait().unwrap();
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     assert_eq!(
         status.signal(),
-        Some(expected_sig),
+        Some(expected_sig as i32),
         "status={status:?} stdout={stdout} stderr={}",
         fs::read_to_string(&stderr_path).unwrap_or_default()
     );
@@ -142,9 +148,9 @@ fn sigterm_subprocess_exits_signaled() {
     spawn_signal_lifecycle_child(
         "term",
         "ai::agent_sdk::driver::termination::tests::sigterm_subprocess_exits_signaled",
-        libc::SIGTERM,
+        Signal::SIGTERM,
         None,
-        libc::SIGTERM,
+        Signal::SIGTERM,
         false,
     );
 }
@@ -154,9 +160,9 @@ fn sigint_subprocess_exits_signaled() {
     spawn_signal_lifecycle_child(
         "int",
         "ai::agent_sdk::driver::termination::tests::sigint_subprocess_exits_signaled",
-        libc::SIGINT,
+        Signal::SIGINT,
         None,
-        libc::SIGINT,
+        Signal::SIGINT,
         false,
     );
 }
@@ -166,9 +172,35 @@ fn second_sigint_kills_during_stuck_shutdown() {
     spawn_signal_lifecycle_child(
         "int-hang",
         "ai::agent_sdk::driver::termination::tests::second_sigint_kills_during_stuck_shutdown",
-        libc::SIGINT,
-        Some(libc::SIGINT),
-        libc::SIGINT,
+        Signal::SIGINT,
+        Some(Signal::SIGINT),
+        Signal::SIGINT,
         true,
     );
+}
+
+#[test]
+fn formats_signal_cause_for_trace_fields() {
+    assert_eq!(super::cause_name(Cause::Sent(Sent::User)), "sent_user");
+    assert_eq!(super::cause_name(Cause::Unknown), "unknown");
+}
+
+#[test]
+fn formats_process_arguments_as_a_shell_command_line() {
+    let arguments = ["agent", "--prompt", "hello world"].map(Into::into);
+
+    assert_eq!(
+        super::format_command_line(&arguments),
+        Some("agent --prompt 'hello world'".to_owned())
+    );
+}
+
+#[test]
+fn omits_command_line_when_process_arguments_are_empty() {
+    assert_eq!(super::format_command_line(&[]), None);
+}
+
+#[test]
+fn omits_command_line_for_invalid_sender_pid() {
+    assert_eq!(super::resolve_command_line(0), None);
 }

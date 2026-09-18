@@ -16,9 +16,13 @@ use futures::channel::oneshot;
 #[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(unix)]
+use signal_hook::iterator::exfiltrator::WithOrigin;
+#[cfg(unix)]
+use signal_hook::low_level::siginfo::{Cause, Chld, Process, Sent};
+#[cfg(unix)]
 use signal_hook::{SigId, flag};
 #[cfg(unix)]
-use signal_hook_tokio::Signals;
+use signal_hook_tokio::SignalsInfo;
 #[cfg(unix)]
 use warpui::r#async::executor::{Background, BackgroundTask};
 
@@ -34,6 +38,16 @@ pub(super) enum InterruptSignal {
     Int,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ObservedSignal {
+    pub(super) signal: InterruptSignal,
+    /// Kernel-reported process metadata. For SIGINT and SIGTERM, this identifies the sender when
+    /// the platform supplies it; kernel-originated signals and some platforms omit it.
+    #[cfg(unix)]
+    sender: Option<Process>,
+    #[cfg(unix)]
+    cause: Cause,
+}
 #[cfg(unix)]
 impl InterruptSignal {
     fn as_raw(self) -> libc::c_int {
@@ -52,6 +66,16 @@ impl InterruptSignal {
     }
 }
 
+#[cfg(unix)]
+impl ObservedSignal {
+    fn from_origin(origin: signal_hook::low_level::siginfo::Origin) -> Option<Self> {
+        Some(Self {
+            signal: InterruptSignal::from_raw(origin.signal)?,
+            sender: origin.process,
+            cause: origin.cause,
+        })
+    }
+}
 /// Why `run_internal` stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RunEndCause {
@@ -60,7 +84,7 @@ pub(super) enum RunEndCause {
     /// `WARP_SANDBOX_DEADLINE` warning window fired.
     SandboxDeadline,
     /// A Unix interrupt arrived while the run was still in progress.
-    Signal(InterruptSignal),
+    Signal(ObservedSignal),
 }
 
 /// The interrupt handlers registered by [`watch_interrupt_signals`], plus the background
@@ -124,7 +148,7 @@ impl Drop for RegisteredHandlers {
 #[cfg(unix)]
 pub(super) async fn watch_interrupt_signals(
     background: &Background,
-) -> io::Result<(oneshot::Receiver<InterruptSignal>, InterruptWatch)> {
+) -> io::Result<(oneshot::Receiver<ObservedSignal>, InterruptWatch)> {
     let shutdown_armed = Arc::new(AtomicBool::new(false));
     let mut handlers = RegisteredHandlers::default();
     for signal in [SIGTERM, SIGINT] {
@@ -142,7 +166,7 @@ pub(super) async fn watch_interrupt_signals(
     let (ready_tx, ready_rx) = oneshot::channel();
     let (signal_tx, signal_rx) = oneshot::channel();
     let task = background.spawn(async move {
-        let mut signals = match Signals::new([SIGTERM, SIGINT]) {
+        let mut signals = match SignalsInfo::<WithOrigin>::new([SIGTERM, SIGINT]) {
             Ok(signals) => signals,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -155,10 +179,10 @@ pub(super) async fn watch_interrupt_signals(
         // Only the signals registered above are delivered, so the first item maps to one
         // of them. The stream itself only ends once the watch is torn down, at which
         // point nothing is waiting on `signal_tx` any more.
-        if let Some(signal) = signals.next().await.and_then(InterruptSignal::from_raw) {
+        if let Some(signal) = signals.next().await.and_then(ObservedSignal::from_origin) {
             log::warn!("Received Unix signal {signal:?}");
-            tracing::warn!(tags.cloud_agent = true, signal = ?signal, "received unix signal");
             let _ = signal_tx.send(signal);
+            emit_signal_trace(signal);
         }
     });
     let handle = ready_rx
@@ -175,6 +199,89 @@ pub(super) async fn watch_interrupt_signals(
     ))
 }
 
+#[cfg(unix)]
+fn emit_signal_trace(signal: ObservedSignal) {
+    let username = signal
+        .sender
+        .and_then(|process| resolve_username(process.uid));
+    let command_line = signal
+        .sender
+        .and_then(|process| resolve_command_line(process.pid));
+    tracing::warn!(
+        tags.cloud_agent = true,
+        signal = signal_name(signal.signal),
+        signal.cause = cause_name(signal.cause),
+        signal.sender.pid = signal.sender.map(|process| process.pid),
+        signal.sender.uid = signal.sender.map(|process| process.uid),
+        signal.sender.username = username,
+        signal.sender.command_line = command_line,
+        "received unix signal"
+    );
+}
+
+#[cfg(unix)]
+fn signal_name(signal: InterruptSignal) -> &'static str {
+    match signal {
+        InterruptSignal::Term => "SIGTERM",
+        InterruptSignal::Int => "SIGINT",
+    }
+}
+
+#[cfg(unix)]
+fn cause_name(cause: Cause) -> &'static str {
+    match cause {
+        Cause::Unknown => "unknown",
+        Cause::Kernel => "kernel",
+        Cause::Sent(sent) => match sent {
+            Sent::User => "sent_user",
+            Sent::TKill => "sent_tkill",
+            Sent::Queue => "sent_queue",
+            Sent::MesgQ => "sent_message_queue",
+            _ => "sent_other",
+        },
+        Cause::Chld(child) => match child {
+            Chld::Exited => "child_exited",
+            Chld::Killed => "child_killed",
+            Chld::Dumped => "child_dumped",
+            Chld::Trapped => "child_trapped",
+            Chld::Stopped => "child_stopped",
+            Chld::Continued => "child_continued",
+            _ => "child_other",
+        },
+        _ => "other",
+    }
+}
+
+#[cfg(unix)]
+fn resolve_username(uid: libc::uid_t) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+}
+
+#[cfg(unix)]
+fn resolve_command_line(pid: libc::pid_t) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let pid = u32::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::Always),
+    );
+    format_command_line(system.process(pid)?.cmd())
+}
+
+#[cfg(unix)]
+fn format_command_line(arguments: &[std::ffi::OsString]) -> Option<String> {
+    (!arguments.is_empty())
+        .then(|| shell_words::join(arguments.iter().map(|argument| argument.to_string_lossy())))
+}
 #[cfg(unix)]
 pub(super) fn emulate_default_and_exit(signal: InterruptSignal) -> ! {
     let _ = signal_hook::low_level::emulate_default_handler(signal.as_raw());

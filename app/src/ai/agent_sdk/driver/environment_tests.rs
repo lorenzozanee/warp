@@ -13,8 +13,8 @@ use super::{
     PrepareEnvironmentError, RepositoryCloneRequest, build_parallel_clone_command,
     build_remove_repository_origins_command, build_resolved_head_command, checkout_command_for,
     checkout_result, environment_snapshot, is_valid_git_object_id, merge_repos_deduped,
-    parse_resolved_head_sha, parse_resolved_head_shas, repository_clone_requests, single_repo_name,
-    validate_repository_preparation_overrides,
+    parse_resolved_head_sha, parse_resolved_head_shas, read_failed_repo_names,
+    repository_clone_requests, single_repo_name, validate_repository_preparation_overrides,
 };
 use crate::ai::cloud_environments::{AmbientAgentEnvironment, SourceRepo};
 use crate::terminal::shell::ShellType;
@@ -346,6 +346,7 @@ fn parallel_clone_command_runs_repos_in_background_and_waits() {
             .map(|repo| clone_request(repo, None))
             .collect::<Vec<_>>(),
         ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
     );
 
     assert!(command.starts_with("sh -c '"));
@@ -362,13 +363,57 @@ fn parallel_clone_command_runs_repos_in_background_and_waits() {
     assert!(command.contains("repo-1.log"));
     assert!(command.contains(">\"$log_file_0\" 2>&1 &"));
     assert!(command.contains(">\"$log_file_1\" 2>&1 &"));
-    assert!(command.contains("pids=\"$pids $!\""));
-    assert!(command.contains("wait \"$pid\""));
+    assert!(command.contains("pid_0=\"$!\""));
+    assert!(command.contains("pid_1=\"$!\""));
+    assert!(command.contains("wait \"$pid_0\""));
+    assert!(command.contains("wait \"$pid_1\""));
+    assert!(command.contains(".warp-clone-failed-test"));
     assert!(command.contains("===== warpdotdev/warp ====="));
     assert!(command.contains("cat \"$log_file_0\""));
     assert!(command.contains("===== platform/backend/api ====="));
     assert!(!command.contains("repository revision results"));
     assert!(command.contains("exit \"$failed\""));
+}
+
+#[test]
+fn parallel_clone_command_records_only_the_failing_repo_name_on_partial_failure() {
+    let repos = vec![
+        SourceRepo::new(
+            CodeForge::GitHub,
+            "warpdotdev".to_string(),
+            "good".to_string(),
+        ),
+        SourceRepo::new(
+            CodeForge::GitHub,
+            "warpdotdev".to_string(),
+            "bad".to_string(),
+        ),
+    ];
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("clone-failed-repos");
+    let script = unwrap_sh_c_script(&build_parallel_clone_command(
+        &repos
+            .into_iter()
+            .map(|repo| clone_request(repo, None))
+            .collect::<Vec<_>>(),
+        ShellType::Bash,
+        &marker,
+    ));
+
+    // Redefine clone_repo with a stub where only "bad" fails, inserted right
+    // before the first invocation, so we drive the real wait/bookkeeping
+    // logic end to end without touching the network. sh uses the latest
+    // definition of a function, so this cleanly shadows the real one.
+    let stub = "clone_repo() {\n  [ \"$1\" = 'warpdotdev/bad' ] && return 1\n  return 0\n}\n";
+    let script = script.replacen("log_file_0=", &format!("{stub}log_file_0="), 1);
+    let output = run_command_output(&script);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        read_failed_repo_names(&marker),
+        Some(vec!["warpdotdev/bad".to_string()])
+    );
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -397,6 +442,7 @@ fn parallel_clone_command_threads_checkout_ref_and_pins_after_clone() {
             })
             .collect::<Vec<_>>(),
         ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
     );
 
     assert!(command.contains("checkout_ref=\"$4\""));
@@ -434,6 +480,7 @@ fn parallel_clone_command_fetches_commit_shas_without_cloning_later_history() {
             ),
         ],
         ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
     );
 
     assert!(command.contains("is_commit_sha=\"$5\""));
@@ -536,7 +583,11 @@ fn substituted_request_uses_target_identity_and_source_checkout_path() {
         "warp-for-benchmarks",
     )];
     let requests = repository_clone_requests(&repos, &overrides, true).unwrap();
-    let command = build_parallel_clone_command(&requests, ShellType::Bash);
+    let command = build_parallel_clone_command(
+        &requests,
+        ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
+    );
 
     assert!(command.contains("https://github.com/warpdotdev/warp-for-benchmarks.git"));
     assert!(command.contains("'warp'"));
@@ -627,7 +678,11 @@ fn clone_requests_use_each_repository_host() {
     ];
 
     let prepared = repository_clone_requests(&repos, &[], false).unwrap();
-    let command = build_parallel_clone_command(&prepared, ShellType::Bash);
+    let command = build_parallel_clone_command(
+        &prepared,
+        ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
+    );
 
     assert_eq!(
         prepared[0].remote.https_clone_url(),
@@ -650,7 +705,11 @@ fn clone_requests_accept_azure_devops_repositories() {
     )];
 
     let prepared = repository_clone_requests(&repos, &[], false).unwrap();
-    let command = build_parallel_clone_command(&prepared, ShellType::Bash);
+    let command = build_parallel_clone_command(
+        &prepared,
+        ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
+    );
 
     assert_eq!(
         prepared[0].remote.https_clone_url(),
@@ -901,6 +960,7 @@ fn applied_preparation_overrides_are_threaded_through_the_existing_clone_command
     let command = build_parallel_clone_command(
         &repository_clone_requests(&repos, &overrides, false).unwrap(),
         ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
     );
 
     assert!(command.contains("'develop'"));
@@ -929,6 +989,7 @@ fn applied_commit_override_uses_sha_only_fetch() {
     let command = build_parallel_clone_command(
         &repository_clone_requests(&repos, &overrides, false).unwrap(),
         ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
     );
 
     assert!(command.contains("'0123456789abcdef0123456789abcdef01234567'"));
@@ -1149,7 +1210,11 @@ fn run_parallel_clone_repo_helper(
             None,
         ),
     ];
-    let script = unwrap_sh_c_script(&build_parallel_clone_command(&repos, ShellType::Bash));
+    let script = unwrap_sh_c_script(&build_parallel_clone_command(
+        &repos,
+        ShellType::Bash,
+        Path::new("/tmp/.warp-clone-failed-test"),
+    ));
 
     // Keep only the clone_repo function definition; drop background clones /
     // waits / logs. Locate by name so we don't grab cleanup_clone_logs instead.
